@@ -10,7 +10,11 @@ import uuid
 import zipfile
 import asyncio
 import shutil
+import sys
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
+
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -190,16 +194,22 @@ async def generate_docs(req: GenerateRequest, background_tasks: BackgroundTasks)
         
     docx_path = os.path.join(task_dir, f"{req.software_name}_软著说明书.docx")
     render_script = os.path.join(os.path.dirname(__file__), "scripts", "universal_doc_gen.py")
+    template_docx_path = os.path.join(os.path.dirname(__file__), "scripts", "template.docx")
     
-    # 【修复 4】将同步的 subprocess.run 改为异步，防止阻塞 FastAPI 事件循环导致团队并发时卡死
+    # 【修复 4】在 Windows 上为了彻底避免 EventLoop 兼容性导致的 NotImplementedError，
+    # 改用线程池包裹同步的 subprocess.run 来实现非阻塞运行
     try:
         import sys
-        process = await asyncio.create_subprocess_exec(
-            sys.executable, render_script, md_path, docx_path, req.software_name,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await process.communicate()
+        import subprocess
+        
+        def run_subprocess():
+            return subprocess.run(
+                [sys.executable, render_script, md_path, docx_path, req.software_name, template_docx_path],
+                capture_output=True
+            )
+            
+        process = await asyncio.to_thread(run_subprocess)
+        stdout, stderr = process.stdout, process.stderr
         
         if process.returncode != 0:
              error_msg = stderr.decode('gbk', errors='ignore') or stderr.decode('utf-8', errors='ignore') or "Unknown error"
