@@ -1,15 +1,14 @@
 """
 /**
- * @vibe-intent 独立平台的后端入口：封装软著生成链路为API，处理上传及LLM调度
+ * @vibe-intent 独立平台的后端入口：封装软著生成链路为API，处理上传及LLM调度 (安全修复版)
  * @vibe-model Gemini 3.1 Pro
- * @vibe-ref intents.md#2026-04-13
  */
 """
 import os
 import re
 import uuid
 import zipfile
-import subprocess
+import asyncio
 import shutil
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -33,10 +32,10 @@ app.add_middleware(
 TEMP_DIR = os.path.join(os.path.dirname(__file__), "temp")
 os.makedirs(TEMP_DIR, exist_ok=True)
 
-# 请在 .env 文件中设置 GEMINI_API_KEY
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 model = genai.GenerativeModel('gemini-2.5-flash')
 
+# 保持你原有的系统提示词不变
 SYSTEM_PROMPT = """
 # [GLOBAL SKILL] Soft Copyright Automation (软著生成专家)
 
@@ -81,23 +80,56 @@ class GenerateRequest(BaseModel):
     task_id: str
     software_name: str
 
+def is_safe_path(basedir, path, follow_symlinks=True):
+    """【修复 1】安全路径校验，防止 Zip Slip 漏洞跨目录写入系统文件"""
+    if follow_symlinks:
+        matchpath = os.path.realpath(path)
+    else:
+        matchpath = os.path.abspath(path)
+    return basedir == os.path.commonpath((basedir, matchpath))
+
 def extract_code(directory: str) -> str:
-    """提取目录下的核心源码文本以便于大模型分析。可以过滤掉无用的内容"""
+    """提取目录下的核心源码文本以便于大模型分析。增加了防爆和多编码支持"""
     core_content = []
     for root, dirs, files in os.walk(directory):
-        if 'node_modules' in dirs:
-            dirs.remove('node_modules')
-        if '.git' in dirs:
-            dirs.remove('.git')
+        # 过滤无关目录，节约大模型 Token
+        dirs[:] = [d for d in dirs if d not in ['.git', 'node_modules', 'dist', '__pycache__', '.idea', '.vscode']]
+        
         for file in files:
-            if file.endswith(('.vue', '.js', '.ts', '.py')):
+            # 过滤掉压缩后的前端资源文件
+            if file.endswith(('.min.js', '.min.css')):
+                continue
+                
+            if file.endswith(('.vue', '.js', '.ts', '.py', '.java', '.go')):
                 filepath = os.path.join(root, file)
+                # 【修复 2】加入多编码回退策略和日志，避免 `except: pass` 吞掉报错导致代码遗失
                 try:
                     with open(filepath, 'r', encoding='utf-8') as f:
-                        core_content.append(f"==== {file} ====\n{f.read()}")
-                except:
-                    pass
-    return "\n\n".join(core_content)[:100000] # 尽量不超太多token
+                        content = f.read()
+                        core_content.append(f"==== {file} ====\n{content}")
+                except UnicodeDecodeError:
+                    try:
+                        with open(filepath, 'r', encoding='gbk') as f:
+                            content = f.read()
+                            core_content.append(f"==== {file} ====\n{content}")
+                    except Exception as e:
+                        print(f"警告：无法读取文件 {filepath}: {str(e)}")
+                except Exception as e:
+                    print(f"读取异常 {filepath}: {str(e)}")
+                    
+    # 如果代码过长，进行安全截断（可按需调大限制，目前预估 10万字符）
+    full_content = "\n\n".join(core_content)
+    if len(full_content) > 100000:
+        print("警告：代码量超出限制，已进行截断处理")
+        return full_content[:100000]
+    return full_content
+
+async def cleanup_task_dir(task_dir: str, delay: int = 3600):
+    """【修复 3】后台延时清理任务：文件保留 1 小时后自动销毁，防止磁盘爆炸"""
+    await asyncio.sleep(delay)
+    if os.path.exists(task_dir):
+        shutil.rmtree(task_dir)
+        print(f"后台清理：已销毁临时文件夹 {task_dir}")
 
 @app.post("/api/upload")
 async def upload_code(file: UploadFile = File(...)):
@@ -114,15 +146,29 @@ async def upload_code(file: UploadFile = File(...)):
         
     if file.filename.endswith('.zip'):
         with zipfile.ZipFile(file_path, 'r') as zip_ref:
+            # 【应用修复 1】解压前执行安全校验
+            for member in zip_ref.namelist():
+                member_path = os.path.join(task_dir, member)
+                if not is_safe_path(task_dir, member_path):
+                    shutil.rmtree(task_dir) # 发现恶意包，立刻销毁
+                    raise HTTPException(status_code=400, detail="检测到不安全的ZIP路径 (Zip Slip漏洞)")
             zip_ref.extractall(task_dir)
             
     return {"task_id": task_id, "status": "Uploaded"}
 
+# /**
+#  * @vibe-intent 响应前端生成请求，调度LLM并渲染Word文档，增加异常穿透
+#  * @vibe-model Gemini 3.1 Pro (High)
+#  * @vibe-ref intents.md#2026-04-21
+#  */
 @app.post("/api/generate")
-async def generate_docs(req: GenerateRequest):
+async def generate_docs(req: GenerateRequest, background_tasks: BackgroundTasks):
     task_dir = os.path.join(TEMP_DIR, req.task_id)
     if not os.path.exists(task_dir):
         raise HTTPException(status_code=404, detail="Task ID not found")
+        
+    # 【应用修复 3】注册后台任务，接口返回后自动开始倒计时清理
+    background_tasks.add_task(cleanup_task_dir, task_dir, 3600)
         
     code_content = extract_code(task_dir)
     if not code_content:
@@ -130,24 +176,39 @@ async def generate_docs(req: GenerateRequest):
          
     prompt = f"{SYSTEM_PROMPT}\n\n请针对以下代码源码生成软著文件要求：\n{code_content}"
     
-    response = model.generate_content(prompt)
-    md_content = response.text
+    # 注意：如果此处并发量大，Gemini调用也建议改用 async 版本，这里先保持同步或走异步包装
+    try:
+        response = model.generate_content(prompt)
+        md_content = response.text
+    except Exception as e:
+        print(f"DEBUG Error during generation: {e}")
+        raise HTTPException(status_code=500, detail=f"LLM Generation failed: {repr(e)}")
     
     md_path = os.path.join(task_dir, "temp_manual.md")
     with open(md_path, 'w', encoding='utf-8') as f:
         f.write(md_content)
         
-    # 调用渲染引擎
     docx_path = os.path.join(task_dir, f"{req.software_name}_软著说明书.docx")
     render_script = os.path.join(os.path.dirname(__file__), "scripts", "universal_doc_gen.py")
     
+    # 【修复 4】将同步的 subprocess.run 改为异步，防止阻塞 FastAPI 事件循环导致团队并发时卡死
     try:
-        subprocess.run(
-            ["python", render_script, md_path, docx_path, req.software_name],
-            check=True
+        import sys
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, render_script, md_path, docx_path, req.software_name,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
         )
+        stdout, stderr = await process.communicate()
+        
+        if process.returncode != 0:
+             error_msg = stderr.decode('gbk', errors='ignore') or stderr.decode('utf-8', errors='ignore') or "Unknown error"
+             raise Exception(f"Return code {process.returncode}, stderr: {error_msg}, stdout: {stdout.decode('gbk', errors='ignore')}")
+             
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Word generation failed: {str(e)}")
+        import traceback
+        tb_str = traceback.format_exc()
+        raise HTTPException(status_code=500, detail=f"Word generation failed: e={repr(e)}, traceback={tb_str}")
         
     return {
          "status": "success",
@@ -159,7 +220,7 @@ async def generate_docs(req: GenerateRequest):
 async def download_doc(task_id: str, filename: str):
     file_path = os.path.join(TEMP_DIR, task_id, filename)
     if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="File not found")
+        raise HTTPException(status_code=404, detail="File not found or expired")
     return FileResponse(file_path, filename=filename)
 
 if __name__ == "__main__":
