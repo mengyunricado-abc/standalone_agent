@@ -15,14 +15,9 @@ Already a pro? Just edit this README.md and make it your own. Want to make it ea
 
 ```
 cd existing_repo
-git remote add origin https://itools.weichai.com/git/weitools/power-system-software/learning-interest-group/agent-learning.git
 git branch -M main
 git push -uf origin main
 ```
-
-## Integrate with your tools
-
-- [ ] [Set up project integrations](https://itools.weichai.com/git/weitools/power-system-software/learning-interest-group/agent-learning/-/settings/integrations)
 
 ## Collaborate with your team
 
