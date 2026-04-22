@@ -82,14 +82,14 @@
       <div class="header">
         <h3>Agent 思考与推演日志</h3>
       </div>
-      <div class="log-container">
+      <div class="log-container" ref="logContainerRef">
         <div class="log-item" v-for="(log, idx) in logs" :key="idx" :class="log.type">
           <span class="time">[{{ log.time }}]</span>
           <span class="msg">{{ log.message }}</span>
         </div>
         <div class="log-item info typing" v-if="processing">
           <span class="time">...</span>
-          <span class="msg">模型正在思考中，这可能需要1-3分钟，请勿刷新页面...</span>
+          <span class="msg">Gemini 3.1 Pro 正在深度推演中，请勿刷新页面...</span>
         </div>
       </div>
     </div>
@@ -97,7 +97,7 @@
 </template>
 
 <script setup>
-import { ref, computed } from 'vue'
+import { ref, computed, nextTick } from 'vue'
 import { ElMessage } from 'element-plus'
 import axios from 'axios'
 import MarkdownIt from 'markdown-it'
@@ -110,6 +110,7 @@ const mdContent = ref('')
 const processing = ref(false)
 const downloadUrl = ref('')
 const logs = ref([])
+const logContainerRef = ref(null)
 
 const renderedHTML = computed(() => {
   return mdContent.value ? md.render(mdContent.value) : ''
@@ -117,12 +118,17 @@ const renderedHTML = computed(() => {
 
 const addLog = (msg, type = 'info') => {
   const d = new Date()
+  const pad = (n) => n.toString().padStart(2, '0')
   logs.value.push({
-    time: `${d.getHours()}:${d.getMinutes()}:${d.getSeconds()}`,
+    time: `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`,
     message: msg,
     type
   })
-  // Let it naturally scroll down a real app would use a ref and scrollToBottom
+  nextTick(() => {
+    if (logContainerRef.value) {
+      logContainerRef.value.scrollTop = logContainerRef.value.scrollHeight
+    }
+  })
 }
 
 const beforeUpload = (file) => {
@@ -152,9 +158,10 @@ const startGeneration = async () => {
   mdContent.value = ''
   downloadUrl.value = ''
   addLog('===========================', 'info')
-  addLog(`触发 /ruanzhu 协议：开始解压并清洗代码...`, 'info')
-  addLog(`激活大语言模型，注入全局规约与防幻觉指令...`, 'info')
-  addLog(`正在生成结构化 Markdown 及 Graphviz 流程图代码...`, 'warning')
+  addLog(`[System] 触发 /ruanzhu 协议：开始解压并清洗源码包...`, 'info')
+  addLog(`[System] 握手成功，已激活 Gemini 3.1 Pro 旗舰模型...`, 'info')
+  addLog(`[Agent] 正在深度审视代码结构，提取核心业务流与交互逻辑...`, 'warning')
+  addLog(`[Agent] 正在生成结构化 Markdown 及辅助理解的 Graphviz 流程图代码...`, 'warning')
   
   try {
     const response = await axios.post('/api/generate', {
@@ -281,6 +288,34 @@ body {
   border-radius: 6px;
   overflow-x: auto;
 }
+.md-preview-container table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 15px 0;
+}
+.md-preview-container th, .md-preview-container td {
+  border: 1px solid #ebeef5;
+  padding: 10px;
+  text-align: left;
+}
+.md-preview-container th {
+  background-color: #fafafa;
+  font-weight: bold;
+}
+.md-preview-container tr:nth-child(even) {
+  background-color: #fcfcfc;
+}
+.md-preview-container blockquote {
+  border-left: 4px solid #409eff;
+  margin: 15px 0;
+  padding: 10px 15px;
+  background-color: #ecf5ff;
+  color: #606266;
+}
+.md-preview-container p {
+  line-height: 1.6;
+  color: #303133;
+}
 .empty-state {
   flex: 1;
   display: flex;
@@ -334,4 +369,21 @@ body {
   50% { opacity: 0.4; }
   100% { opacity: 1; }
 }
+
+/* 响应式适配 */
+@media (max-width: 1200px) {
+  .sidebar-left, .sidebar-right {
+    width: 260px;
+  }
+}
+
+@media (max-width: 992px) {
+  .sidebar-right {
+    display: none; /* 在较小屏幕下隐藏侧边栏日志以保证中间阅读体验 */
+  }
+  .sidebar-left {
+    width: 240px;
+  }
+}
 </style>
+
