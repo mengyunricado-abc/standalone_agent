@@ -1,8 +1,8 @@
 <!--
 /**
- * @vibe-intent 独立平台的前端主交互界面：实现三栏式布局及与后端的软著生成流通信
+ * @vibe-intent 独立平台的前端主交互界面：优化下载触发逻辑与 URL 解码日志
  * @vibe-model Gemini 3.1 Pro
- * @vibe-ref intents.md#2026-04-13
+ * @vibe-ref intents.md#2026-04-24
  */
 -->
 <template>
@@ -44,9 +44,10 @@
           @click="startGeneration" 
           :loading="processing"
           style="width: 100%;"
-          :disabled="!taskId || !softwareName"
+          :disabled="!taskId || !softwareName || cooldown > 0"
         >
-          {{ processing ? 'AI 正在深度解析源码...' : '启动智能拆解与生成' }}
+          <span v-if="cooldown > 0">冷却中 ({{ cooldown }}s)</span>
+          <span v-else>{{ processing ? 'AI 正在深度解析源码...' : '启动智能拆解与生成' }}</span>
         </el-button>
       </div>
       
@@ -59,7 +60,7 @@
         >
         </el-alert>
         <el-button type="success" @click="downloadDocx" style="width: 100%; margin-top: 15px;">
-          ⬇️ 下载最终 Word (.docx)
+          ⬇️ 下载全套材料包 (.zip)
         </el-button>
       </div>
     </div>
@@ -108,6 +109,7 @@ const taskId = ref(null)
 const softwareName = ref('示例系统')
 const mdContent = ref('')
 const processing = ref(false)
+const cooldown = ref(0)
 const downloadUrl = ref('')
 const logs = ref([])
 const logContainerRef = ref(null)
@@ -178,17 +180,44 @@ const startGeneration = async () => {
     }
   } catch (err) {
     console.error(err)
-    addLog(`生成过程引发异常: ${err.response?.data?.detail || err.message}`, 'error')
-    ElMessage.error(`生成失败：${err.response?.data?.detail || err.message}`)
+    const status = err.response?.status
+    const msg = err.response?.data?.detail || err.message
+    
+    addLog(`生成过程引发异常: ${msg}`, 'error')
+    
+    if (status === 429) {
+      startCooldown(30)
+      ElMessage.warning('触碰 API 频率限制，已开启 30 秒冷却保护')
+    } else {
+      ElMessage.error(`生成失败：${msg}`)
+    }
   } finally {
     processing.value = false
   }
 }
 
+const startCooldown = (seconds) => {
+  cooldown.value = seconds
+  const timer = setInterval(() => {
+    cooldown.value--
+    if (cooldown.value <= 0) {
+      clearInterval(timer)
+      addLog('冷却结束，可以重新尝试生成。', 'success')
+    }
+  }, 1000)
+}
+
 const downloadDocx = () => {
   if (downloadUrl.value) {
-    addLog(`触发文件下载：${softwareName.value}_软著说明书.docx`, 'success')
-    window.open(downloadUrl.value, '_blank')
+    const link = document.createElement('a')
+    link.href = downloadUrl.value
+    // 从 URL 中提取文件名进行解码显示在日志
+    const fileName = decodeURIComponent(downloadUrl.value.split('/').pop())
+    addLog(`触发文件下载：${fileName}`, 'success')
+    link.setAttribute('download', fileName)
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
   }
 }
 </script>

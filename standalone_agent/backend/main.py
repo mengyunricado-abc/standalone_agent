@@ -1,7 +1,8 @@
 """
 /**
- * @vibe-intent 独立平台的后端入口：封装软著生成链路为API，处理上传及LLM调度 (安全修复版)
- * @vibe-model Gemini 3.1 Pro
+ * @vibe-intent 独立平台的后端入口：封装软著生成链路为API，处理上传及LLM调度 (安全修复 & 编码增强版)
+ * @vibe-model Gemini 3.1 Pro (High)
+ * @vibe-ref intents.md#2026-04-24
  */
 """
 import os
@@ -11,6 +12,7 @@ import zipfile
 import asyncio
 import shutil
 import sys
+from urllib.parse import quote
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
 
 if sys.platform == "win32":
@@ -39,45 +41,44 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 model = genai.GenerativeModel('gemini-2.5-flash')
 
-# 保持你原有的系统提示词不变
+# 全新的双任务 JSON 驱动 System Prompt
 SYSTEM_PROMPT = """
-# [GLOBAL SKILL] Soft Copyright Automation (软著生成专家)
+# Role: 资深软件架构分析师与软著合规专家
 
-你是一个“企业级高级技术文档工程师”，严格按顺序执行以下工作流：
+## Objective
+基于用户提供的源代码，进行“功能逻辑提炼”，并一次性生成包含《登记申请表》和《设计说明书》所需全部字段的 JSON 格式数据。
 
-1. **绝对遵守文风与视角铁律**：
-   - **屏蔽代码词汇**：严禁出现“路由、Hook、DOM、接口、防抖、异步、后端、组件库”等技术词汇。
-   - **按用户行为**：描述以“用户点击...”、“界面展示...”、“系统校验...”为主体。
-   - **平实克制**：严禁夸张修辞，使用客观中立的操作说明书语言。
+## 🚫 绝对红线（内容与文风约束）
+1. **文风铁律（极度重要）**：
+   - 必须站在“最终用户”的角度编写，严禁暴露底层代码实现。
+   - **屏蔽代码词汇**：严禁出现“路由、Hook、DOM、接口、防抖(debounce)、生命周期、后端、API、Vue组件”等技术词汇。不要提具体的文件名或函数名。
+   - **按用户行为描述**：描述以“用户点击...”、“界面展示...”、“系统校验...”为主体。
+2. 必须输出纯 JSON，不含 Markdown 标记（如 ```json）。
+3. 禁止虚构不存在的宏大业务模块，所有功能必须有源码支撑。
 
-2. **绝对遵守结构铁律（严禁增减标题）**：
-   - `# 1. 编写目的` 
-   - `# 2. 功能设计`
-     - `## 2.1 软件介绍`
-     - `## 2.2 界面设计`
-   - `# 3. 系统操作说明`
-     - `## 3.1 运行环境配置` (操作系统/浏览器等)
-     - `## 3.2 [核心业务模块1]`
-       - `### 3.2.1 [子操作1]` (包含前提条件、详细按步操作、预期反馈)
-   - `# 4. 异常处理`
-
-3. **图表占位硬指标（必须 ≥ 5张）**：
-   - **独立成行，且上下空行**。
-   - `[图1：系统主流程图]` (放在2.1末尾)
-   - `[图2：主界面全局布局截图]` (放在2.2末尾)
-   - 其余至少3张截图分布在3.2及第4章。
-
-4. **流程图语法铁律**：
-   - 必须在 Markdown 末尾生成标准 Graphviz DOT 代码。
-   - 严禁使用 Mermaid。结构必须如下：
-   [FLOW-CONFIG-START]
-   digraph G {
-       node [shape=box, fontname="SimHei"];
-       Start [label="打开系统", shape=oval];
-       Node1 [label="执行操作"];
-       Start -> Node1;
-   }
-   [FLOW-CONFIG-END]
+## 📥 JSON Schema 要求 (必须严格遵循)
+{
+  "application_form": {
+    "software_name": "提取软件全称",
+    "dev_purpose": "简述开发目的（限50字内）",
+    "main_functions": "整体功能详述，限500-1300字（客观描述系统流转、状态控制与数据交互，严禁代码词汇）",
+    "tech_features": "技术特点，限100字内"
+  },
+  "design_doc": {
+    "full_name": "同上软件全称",
+    "intro": "系统简介，限300字内",
+    "modules": [
+      {
+        "name": "模块A名称（如：文件上传与校验模块）",
+        "desc": "详细描述该模块的业务逻辑和预期交互，限100-300字（严禁代码词汇）"
+      },
+      {
+        "name": "模块B名称",
+        "desc": "详细描述..."
+      }
+    ]
+  }
+}
 """
 
 class GenerateRequest(BaseModel):
@@ -130,10 +131,15 @@ def extract_code(directory: str) -> str:
 
 async def cleanup_task_dir(task_dir: str, delay: int = 3600):
     """【修复 3】后台延时清理任务：文件保留 1 小时后自动销毁，防止磁盘爆炸"""
-    await asyncio.sleep(delay)
-    if os.path.exists(task_dir):
-        shutil.rmtree(task_dir)
-        print(f"后台清理：已销毁临时文件夹 {task_dir}")
+    try:
+        await asyncio.sleep(delay)
+        if os.path.exists(task_dir):
+            shutil.rmtree(task_dir, ignore_errors=True) # ignore_errors 解决 Windows 下文件占用导致的崩溃
+            print(f"后台清理：已销毁临时文件夹 {task_dir}")
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        print(f"清理临时目录失败: {e}")
 
 @app.post("/api/upload")
 async def upload_code(file: UploadFile = File(...)):
@@ -161,9 +167,9 @@ async def upload_code(file: UploadFile = File(...)):
     return {"task_id": task_id, "status": "Uploaded"}
 
 # /**
-#  * @vibe-intent 响应前端生成请求，调度LLM并渲染Word文档，增加异常穿透
+#  * @vibe-intent 响应前端生成请求，调度LLM并渲染Word文档，修复URL编码与响应头
 #  * @vibe-model Gemini 3.1 Pro (High)
-#  * @vibe-ref intents.md#2026-04-21
+#  * @vibe-ref intents.md#2026-04-24
 #  */
 @app.post("/api/generate")
 async def generate_docs(req: GenerateRequest, background_tasks: BackgroundTasks):
@@ -171,59 +177,86 @@ async def generate_docs(req: GenerateRequest, background_tasks: BackgroundTasks)
     if not os.path.exists(task_dir):
         raise HTTPException(status_code=404, detail="Task ID not found")
         
-    # 【应用修复 3】注册后台任务，接口返回后自动开始倒计时清理
     background_tasks.add_task(cleanup_task_dir, task_dir, 3600)
-        
     code_content = extract_code(task_dir)
     if not code_content:
-         raise HTTPException(status_code=400, detail="No readable code found")
+         raise HTTPException(status_code=400, detail="未找到可解析的代码文件")
          
-    prompt = f"{SYSTEM_PROMPT}\n\n请针对以下代码源码生成软著文件要求：\n{code_content}"
+    prompt = f"{SYSTEM_PROMPT}\n\n请针对以下代码源码生成软著要求：\n{code_content}"
     
-    # 注意：如果此处并发量大，Gemini调用也建议改用 async 版本，这里先保持同步或走异步包装
     try:
         response = model.generate_content(prompt)
-        md_content = response.text
+        raw_text = response.text
+        # 清洗 JSON
+        cleaned_json = re.sub(r'^```(json)?\s*', '', raw_text, flags=re.IGNORECASE)
+        cleaned_json = re.sub(r'```\s*$', '', cleaned_json).strip()
     except Exception as e:
-        print(f"DEBUG Error during generation: {e}")
-        raise HTTPException(status_code=500, detail=f"LLM Generation failed: {repr(e)}")
+        err_msg = str(e)
+        if "429" in err_msg or "Quota exceeded" in err_msg:
+            raise HTTPException(status_code=429, detail="API频率达到免费层级上限，请冷静 30 秒后再试")
+        if "503" in err_msg:
+            raise HTTPException(status_code=503, detail="Google服务暂时繁忙（503），建议稍后重试")
+        raise HTTPException(status_code=500, detail=f"AI 生成失败: {err_msg}")
     
-    md_path = os.path.join(task_dir, "temp_manual.md")
-    with open(md_path, 'w', encoding='utf-8') as f:
-        f.write(md_content)
+    # 1. 保存 JSON (前端也可据此预览排错)
+    json_path = os.path.join(task_dir, "data.json")
+    with open(json_path, 'w', encoding='utf-8') as f:
+        f.write(cleaned_json)
         
-    docx_path = os.path.join(task_dir, f"{req.software_name}_软著说明书.docx")
+    # 2. 定义路径
     render_script = os.path.join(os.path.dirname(__file__), "scripts", "universal_doc_gen.py")
-    template_docx_path = os.path.join(os.path.dirname(__file__), "scripts", "template.docx")
+    template_app_path = os.path.join(os.path.dirname(__file__), "scripts", "template_app.docx")
+    template_design_path = os.path.join(os.path.dirname(__file__), "scripts", "template_design.docx")
     
-    # 【修复 4】在 Windows 上为了彻底避免 EventLoop 兼容性导致的 NotImplementedError，
-    # 改用线程池包裹同步的 subprocess.run 来实现非阻塞运行
+    # 清洗软件名称，防止特殊字符导致路径或 URL 异常
+    safe_name = re.sub(r'[\\/:*?"<>|]', '', req.software_name).strip().replace(' ', '_')
+    if not safe_name: safe_name = "software"
+
+    out_app_path = os.path.join(task_dir, f"{safe_name}_申请表.docx")
+    out_design_path = os.path.join(task_dir, f"{safe_name}_说明书.docx")
+    zip_filename = f"{safe_name}_软著材料包.zip"
+    zip_output_path = os.path.join(task_dir, zip_filename)
+    
     try:
         import sys
         import subprocess
         
+        # 调用基于 docxtpl 的新渲染引擎
         def run_subprocess():
             return subprocess.run(
-                [sys.executable, render_script, md_path, docx_path, req.software_name, template_docx_path],
+                [sys.executable, render_script, json_path, template_app_path, template_design_path, out_app_path, out_design_path],
                 capture_output=True
             )
             
         process = await asyncio.to_thread(run_subprocess)
-        stdout, stderr = process.stdout, process.stderr
         
         if process.returncode != 0:
-             error_msg = stderr.decode('gbk', errors='ignore') or stderr.decode('utf-8', errors='ignore') or "Unknown error"
-             raise Exception(f"Return code {process.returncode}, stderr: {error_msg}, stdout: {stdout.decode('gbk', errors='ignore')}")
+             error_msg = process.stderr.decode('gbk', errors='ignore') or "渲染引擎未知错误"
+             raise Exception(f"渲染失败: {error_msg}")
+             
+        # 【核心修复】：显式指定 ZIP 压缩标准，并确保 ZIP 文件流在响应前完全闭合
+        with zipfile.ZipFile(zip_output_path, 'w', compression=zipfile.ZIP_DEFLATED) as z:
+            if os.path.exists(out_app_path):
+                # arcname 设为纯文件名，避免包含绝对路径
+                z.write(out_app_path, os.path.basename(out_app_path))
+            if os.path.exists(out_design_path):
+                z.write(out_design_path, os.path.basename(out_design_path))
+                
+        # 防呆设计：检查 zip 文件是否真正生成且有效
+        if not os.path.exists(zip_output_path) or os.path.getsize(zip_output_path) < 100:
+            raise Exception("ZIP 文件生成为空或损坏，请检查 Word 渲染日志")
              
     except Exception as e:
         import traceback
-        tb_str = traceback.format_exc()
-        raise HTTPException(status_code=500, detail=f"Word generation failed: e={repr(e)}, traceback={tb_str}")
+        error_detail = f"打包或生成失败: {str(e)}\n{traceback.format_exc()}"
+        print(error_detail)
+        raise HTTPException(status_code=500, detail=error_detail)
         
     return {
          "status": "success",
-         "markdown_preview": md_content,
-         "download_url": f"/api/download/{req.task_id}/{req.software_name}_软著说明书.docx"
+         # 将清洗后的 JSON 返回前端预览，方便你核对文风是否恢复正常
+         "markdown_preview": f"```json\n{cleaned_json}\n```", 
+         "download_url": f"/api/download/{req.task_id}/{quote(zip_filename)}"
     }
 
 @app.get("/api/download/{task_id}/{filename}")
@@ -231,7 +264,20 @@ async def download_doc(task_id: str, filename: str):
     file_path = os.path.join(TEMP_DIR, task_id, filename)
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found or expired")
-    return FileResponse(file_path, filename=filename)
+    
+    # 【核心修复】：双重响应头策略，filename 用于常规下载，filename* 用于现代浏览器的 UTF-8 支持
+    # 注意：filename 字段通常需要去除特殊字符或使用 quote
+    safe_filename = quote(filename)
+    content_disposition = f"attachment; filename=\"{safe_filename}\"; filename*=utf-8''{safe_filename}"
+    
+    return FileResponse(
+        file_path, 
+        media_type='application/zip',
+        headers={
+            "Content-Disposition": content_disposition,
+            "Access-Control-Expose-Headers": "Content-Disposition" # 允许前端获取文件名
+        }
+    )
 
 if __name__ == "__main__":
     import uvicorn
